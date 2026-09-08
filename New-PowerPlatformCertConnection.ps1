@@ -1,21 +1,35 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Creates a certificate-authenticated Power Platform connection - Dataverse, Key Vault, or a
-    Power Automate Desktop run-owner connection - using app-only (client_credentials + certificate)
-    auth throughout. No delegated/interactive sign-in is used for any Dataverse/Power
-    Platform/Graph call.
+    Creates a Power Platform connection - Dataverse, Key Vault, or a Power Automate Desktop
+    run-owner connection - whose embedded Connection/RunOwner identity always authenticates via
+    a certificate (app-only). The Caller identity that performs the Dataverse/Power
+    Platform/Graph calls to actually create it can be either a certificate-based Service
+    Principal, or your own delegated (interactive) sign-in - see -CallerAuthMode.
 
 .DESCRIPTION
-    Two identities are always involved: the Caller (authenticates every API call with its own
-    certificate) and the Connection/RunOwner identity (never authenticates anything itself - its
-    client id + certificate are just embedded in the connection for Power Platform to use at run
-    time). The Connection/RunOwner app must already have whatever access the target service
-    requires.
+    Two identities are always involved: the Caller (performs every API call) and the
+    Connection/RunOwner identity (never authenticates anything itself - its client id and
+    certificate are just embedded in the connection for Power Platform to use at run time). The
+    Connection/RunOwner app must already have whatever access the target service requires.
 
-    Certificates for either identity can come from a local certificate store (by thumbprint), a
+    The Caller supports two auth modes (-CallerAuthMode):
+      - Certificate (default): client_credentials + a certificate JWT assertion, no interactive
+        sign-in at all.
+      - Delegated: your own interactive sign-in via the `az` CLI (`az login` if not already
+        signed in), then `az account get-access-token` for whichever resource is needed. No
+        -CallerClientId or certificate is needed for the Caller in this mode.
+
+    Certificates for the Connection/RunOwner identity - and for the Caller when
+    -CallerAuthMode is Certificate - can come from a local certificate store (by thumbprint), a
     local .pfx file, or Azure Key Vault (the az CLI's own signed-in session is used just to read
     the secret - see the *KeyVault* parameters below).
+
+.PARAMETER CallerAuthMode
+    Certificate (default): the Caller authenticates as a Service Principal via
+    -CallerClientId + a certificate source. Delegated: the Caller authenticates as
+    whichever identity is (or becomes, via an interactive `az login` prompt) signed in to the
+    Azure CLI - -CallerClientId and every Caller certificate parameter are ignored.
 
 .PARAMETER ConnectionType
     Dataverse, KeyVault, or PadRunOwner. Each type needs a different set of parameters - see the
@@ -37,6 +51,14 @@
         -CallerClientId $callerAppId -CallerCertThumbprint $callerThumbprint `
         -ConnectionClientId $connectionAppId -ConnectionCertThumbprint $connectionThumbprint `
         -ShareWithUpns 'admin@contoso.onmicrosoft.com' -ShareAccessLevel CanEdit
+
+.EXAMPLE
+    # Dataverse connection, Caller uses delegated (interactive) auth instead of a certificate -
+    # only the embedded Connection identity needs a certificate in this mode
+    .\New-PowerPlatformCertConnection.ps1 -ConnectionType Dataverse `
+        -TenantId $tenantId -EnvironmentId $envId -DataverseUrl 'https://contoso.crm.dynamics.com' `
+        -CallerAuthMode Delegated `
+        -ConnectionClientId $connectionAppId -ConnectionCertThumbprint $connectionThumbprint
 
 .EXAMPLE
     # Key Vault connection, connection cert pulled live from Key Vault via az cli
@@ -76,8 +98,11 @@ param(
     [hashtable]$ExtraParameters = @{},
     [string]$SecurityRoleName = 'System Administrator',
 
-    # Caller identity - authenticates every call
-    [Parameter(Mandatory)][string]$CallerClientId,
+    # Caller identity - authenticates every call. -CallerAuthMode Certificate (default) needs
+    # -CallerClientId + a certificate source below; Delegated needs neither (uses your own
+    # interactive az CLI sign-in instead) and ignores the rest of this group.
+    [ValidateSet('Certificate', 'Delegated')][string]$CallerAuthMode = 'Certificate',
+    [string]$CallerClientId,
     [string]$CallerCertThumbprint,
     [ValidateSet('CurrentUser', 'LocalMachine')][string]$CallerCertStoreLocation = 'CurrentUser',
     [string]$CallerPfxPath,
@@ -143,6 +168,9 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'Modules\PowerPlatformCertConnection.Common.psm1') -Force
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 if (-not $ConnectionLogPath) { $ConnectionLogPath = Join-Path $OutputDirectory 'CreatedConnections.log.txt' }
+if ($CallerAuthMode -eq 'Certificate' -and -not $CallerClientId) {
+    throw "-CallerClientId is required when -CallerAuthMode is 'Certificate' (the default). Pass -CallerAuthMode Delegated to sign in interactively instead."
+}
 
 # --- Validate parameters for the selected connection type ---
 switch ($ConnectionType) {
@@ -172,12 +200,18 @@ if (-not $ConnectionDisplayName) {
 }
 
 # --- Authenticate as the Caller identity ---
-Write-Host "Loading Caller certificate..." -ForegroundColor Cyan
-$callerCert = Get-PPCertificateFromSource -Label 'Caller cert' -TenantId $TenantId `
-    -Thumbprint $CallerCertThumbprint -StoreLocation $CallerCertStoreLocation `
-    -PfxPath $CallerPfxPath -PfxPassword $CallerPfxPassword `
-    -KeyVaultName $CallerKeyVaultName -KeyVaultSecretName $CallerKeyVaultSecretName `
-    -KeyVaultSecretVersion $CallerKeyVaultSecretVersion -KeyVaultPfxPassword $CallerKeyVaultPfxPassword
+$callerCert = $null
+if ($CallerAuthMode -eq 'Certificate') {
+    Write-Host "Loading Caller certificate..." -ForegroundColor Cyan
+    $callerCert = Get-PPCertificateFromSource -Label 'Caller cert' -TenantId $TenantId `
+        -Thumbprint $CallerCertThumbprint -StoreLocation $CallerCertStoreLocation `
+        -PfxPath $CallerPfxPath -PfxPassword $CallerPfxPassword `
+        -KeyVaultName $CallerKeyVaultName -KeyVaultSecretName $CallerKeyVaultSecretName `
+        -KeyVaultSecretVersion $CallerKeyVaultSecretVersion -KeyVaultPfxPassword $CallerKeyVaultPfxPassword
+}
+else {
+    Write-Host "Caller will sign in interactively (delegated, via az CLI) - no certificate needed." -ForegroundColor Cyan
+}
 
 $connectorInfo = $null
 if ($ConnectionType -in 'Dataverse', 'KeyVault') {
@@ -189,9 +223,9 @@ if ($ConnectionType -in 'Dataverse', 'KeyVault') {
     }
 
     if ($ConnectionType -eq 'Dataverse') {
-        Write-Host "Validating certificate auth against Dataverse (WhoAmI)..." -ForegroundColor Cyan
-        $dvToken = Get-PPCertClientCredentialsToken -TenantId $TenantId -ClientId $CallerClientId -Certificate $callerCert `
-            -Scope (Get-PPScopeForResource $DataverseUrl) -LoginAuthorityBaseUrl $LoginAuthorityBaseUrl -TimeoutSec $TimeoutSec
+        Write-Host "Validating Caller auth against Dataverse (WhoAmI)..." -ForegroundColor Cyan
+        $dvToken = Get-PPCallerToken -AuthMode $CallerAuthMode -Resource $DataverseUrl -TenantId $TenantId `
+            -ClientId $CallerClientId -Certificate $callerCert -LoginAuthorityBaseUrl $LoginAuthorityBaseUrl -TimeoutSec $TimeoutSec
         $who = Invoke-RestMethod -Uri "$DataverseUrl/api/data/v9.2/WhoAmI" -Headers @{ Authorization = "Bearer $dvToken" } -TimeoutSec $TimeoutSec
         Write-Host "WhoAmI succeeded. UserId=$($who.UserId)" -ForegroundColor Green
 
@@ -205,8 +239,8 @@ if ($ConnectionType -in 'Dataverse', 'KeyVault') {
 
 # --- Build and create the connection ---
 Write-Host "Creating the $ConnectionType connection..." -ForegroundColor Cyan
-$ppToken = Get-PPCertClientCredentialsToken -TenantId $TenantId -ClientId $CallerClientId -Certificate $callerCert `
-    -Scope (Get-PPScopeForResource $PowerPlatformApiResource) -LoginAuthorityBaseUrl $LoginAuthorityBaseUrl -TimeoutSec $TimeoutSec
+$ppToken = Get-PPCallerToken -AuthMode $CallerAuthMode -Resource $PowerPlatformApiResource -TenantId $TenantId `
+    -ClientId $CallerClientId -Certificate $callerCert -LoginAuthorityBaseUrl $LoginAuthorityBaseUrl -TimeoutSec $TimeoutSec
 $envApiHost = Get-PPEnvironmentApiHost -EnvironmentId $EnvironmentId -DomainSuffix $EnvironmentApiDomainSuffix
 
 if ($ConnectionType -in 'Dataverse', 'KeyVault') {
@@ -285,8 +319,8 @@ if ($ShareWithUpns.Count -gt 0) {
     $graphToken = $null
     $needsGraph = $ShareWithUpns | Where-Object { $_ -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' }
     if ($needsGraph) {
-        $graphToken = Get-PPCertClientCredentialsToken -TenantId $TenantId -ClientId $CallerClientId -Certificate $callerCert `
-            -Scope 'https://graph.microsoft.com/.default' -LoginAuthorityBaseUrl $LoginAuthorityBaseUrl -TimeoutSec $TimeoutSec
+        $graphToken = Get-PPCallerToken -AuthMode $CallerAuthMode -Resource 'https://graph.microsoft.com' -TenantId $TenantId `
+            -ClientId $CallerClientId -Certificate $callerCert -LoginAuthorityBaseUrl $LoginAuthorityBaseUrl -TimeoutSec $TimeoutSec
     }
 
     foreach ($upn in $ShareWithUpns) {

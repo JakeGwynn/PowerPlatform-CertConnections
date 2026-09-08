@@ -1,19 +1,21 @@
 # PowerPlatform-CertConnections
 
-PowerShell scripts for creating, sharing, and auditing certificate-authenticated Power Platform
-connections - Dataverse, Key Vault, and Power Automate Desktop "run-owner" connections - without
-any delegated/interactive sign-in. Every call authenticates as a Service Principal using a
-certificate (`client_credentials` + a JWT assertion, RFC 7523).
+PowerShell scripts for creating, sharing, and auditing Power Platform connections - Dataverse,
+Key Vault, and Power Automate Desktop "run-owner" connections. The Caller identity that performs
+each API call can authenticate either as a Service Principal using a certificate
+(`client_credentials` + a JWT assertion, RFC 7523), or via your own delegated (interactive)
+sign-in - see [Caller authentication](#caller-authentication).
 
 Works on both Windows PowerShell 5.1 and PowerShell 7+.
 
 ## Requirements
 
 - Windows PowerShell 5.1+ or PowerShell 7+, on Windows
+- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) - required if the Caller
+  uses delegated auth, or if any certificate is sourced from Azure Key Vault
 - Existing app registrations (Service Principals) with their certificates already uploaded to
-  Entra ID
-- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), only if you want to source
-  a certificate from Azure Key Vault
+  Entra ID, for whichever identities use Certificate auth (always required for the
+  Connection/RunOwner identity; required for the Caller unless it uses delegated auth)
 
 ## Install
 
@@ -38,12 +40,24 @@ cd PowerPlatform-CertConnections
 
 Two identities are involved in creating a connection:
 
-- **Caller** - authenticates every API call with its own certificate.
+- **Caller** - performs every API call. Supports two auth modes, selected via `-CallerAuthMode`:
+  `Certificate` (default) or `Delegated`. See [Caller authentication](#caller-authentication).
 - **Connection / Run Owner** - never authenticates anything itself; its client id + certificate
   are just embedded in the connection for Power Platform to use at run time. This app must
-  already have whatever access the target service requires.
+  already have whatever access the target service requires. Always `Certificate`-based - there's
+  no delegated option for it, since it isn't an identity that signs in anywhere.
 
-Either identity's certificate can come from:
+## Caller authentication
+
+| Mode | How it works | Needs |
+|---|---|---|
+| `Certificate` (default) | `client_credentials` + a certificate JWT assertion (RFC 7523) | `-CallerClientId` + a certificate source (below) |
+| `Delegated` | Your own interactive sign-in, via the `az` CLI's own session (`az login` if not already signed in, then `az account get-access-token`) | Nothing else - `-CallerClientId` and every Caller certificate parameter are ignored |
+
+## Certificate sources
+
+For any identity using `Certificate` auth (the Connection/RunOwner identity always; the Caller
+when `-CallerAuthMode Certificate`), its certificate can come from:
 
 | Source | Parameters |
 |---|---|
@@ -52,13 +66,15 @@ Either identity's certificate can come from:
 | Azure Key Vault | `-<Identity>KeyVaultName` + `-<Identity>KeyVaultSecretName` |
 
 `<Identity>` is `Caller`, `Connection` (Dataverse/KeyVault types), or `RunOwner` (PadRunOwner
-type). The Key Vault source is the one place a signed-in session is used: it calls the `az` CLI
-(`az login` if you're not already signed in) to read the certificate's private key. That session
-is only ever used to fetch the key - never to call Dataverse, Power Platform, or Graph.
+type). The Key Vault source calls the `az` CLI (`az login` if you're not already signed in) to
+read the certificate's private key - the same sign-in session a Delegated Caller uses, just for a
+different purpose (reading a secret vs. authenticating the call itself).
 
 ## Prerequisites
 
-- The Caller and Connection/RunOwner app registrations and their certificates already exist.
+- Whichever identities use Certificate auth already have their app registration and certificate
+  set up. A Delegated Caller needs no app registration - just an `az`-CLI-signed-in account with
+  whatever Dataverse/Power Platform/Graph access it needs to perform the requested operation.
 - The Connection/RunOwner app already has whatever access the target service requires:
   - **Dataverse**: the script will create a Dataverse application user + security role for it if
     one doesn't already exist.
@@ -81,6 +97,18 @@ is only ever used to fetch the key - never to call Dataverse, Power Platform, or
     -TenantId $tenantId -EnvironmentId $envId `
     -DataverseUrl 'https://contoso.crm.dynamics.com' `
     -CallerClientId $callerAppId -CallerCertThumbprint $callerThumbprint `
+    -ConnectionClientId $connectionAppId -ConnectionCertThumbprint $connectionThumbprint `
+    -ShareWithUpns 'admin@contoso.onmicrosoft.com' -ShareAccessLevel CanEdit
+```
+
+Same thing with a delegated Caller (interactive sign-in, no Caller app registration or
+certificate needed - only the embedded Connection identity still needs one):
+
+```powershell
+.\New-PowerPlatformCertConnection.ps1 -ConnectionType Dataverse `
+    -TenantId $tenantId -EnvironmentId $envId `
+    -DataverseUrl 'https://contoso.crm.dynamics.com' `
+    -CallerAuthMode Delegated `
     -ConnectionClientId $connectionAppId -ConnectionCertThumbprint $connectionThumbprint `
     -ShareWithUpns 'admin@contoso.onmicrosoft.com' -ShareAccessLevel CanEdit
 ```
@@ -149,8 +177,20 @@ happen (they're read-only), but nothing is created, shared, or logged.
     -PrincipalUpnsOrIds 'janedoe@contoso.onmicrosoft.com', 'admin@contoso.onmicrosoft.com' -AccessLevel CanUse
 ```
 
-`-PrincipalUpnsOrIds` accepts UPNs/emails (resolved via Graph - the Caller app needs
-`User.Read.All` application permission, admin-consented) or raw Entra object IDs directly.
+Or with a delegated Caller:
+
+```powershell
+.\Grant-PowerPlatformConnectionAccess.ps1 `
+    -TenantId $tenantId -EnvironmentId $envId `
+    -Connector 'shared_commondataserviceforapps' -ConnectionId $connectionId `
+    -CallerAuthMode Delegated `
+    -PrincipalUpnsOrIds 'janedoe@contoso.onmicrosoft.com' -AccessLevel CanUse
+```
+
+`-PrincipalUpnsOrIds` accepts UPNs/emails (resolved via Graph) or raw Entra object IDs directly.
+Resolving a UPN/email needs Graph user-read access: a Certificate Caller needs `User.Read.All`
+application permission (admin-consented); a Delegated Caller uses whatever directory-read access
+the signed-in account already has.
 
 ## Checking who has access
 
@@ -177,3 +217,9 @@ Caller identity to own the connection (or otherwise be entitled on it) - a non-o
 All three scripts expose `-LoginAuthorityBaseUrl`, `-PowerPlatformApiResource`,
 `-EnvironmentApiDomainSuffix`, `-ApiVersion`, and `-TimeoutSec` overrides. Defaults are the public
 commercial cloud; verify the correct values for your cloud before relying on the overrides.
+
+These overrides apply to Certificate-mode token requests, which this repo makes directly. A
+Delegated Caller instead gets its token via `az account get-access-token`, so it follows the
+Azure CLI's own cloud context (`az cloud set --name AzureUSGovernment`, etc.) rather than
+`-LoginAuthorityBaseUrl` - set that with the `az` CLI itself before using `-CallerAuthMode
+Delegated` outside the public commercial cloud.

@@ -3,11 +3,18 @@
     Shared functions used by New-PowerPlatformCertConnection.ps1, Grant-PowerPlatformConnectionAccess.ps1
     and Get-PowerPlatformConnectionPermissions.ps1.
 
-    Every call this module makes to Dataverse, the Power Platform connectivity API, or Microsoft
-    Graph authenticates as a Service Principal using a certificate (client_credentials + a JWT
-    assertion). The only delegated (interactive) sign-in anywhere is opt-in: if you choose a Key
-    Vault certificate source, Get-PPKeyVaultSecretViaAzCli uses your own `az` CLI session to read
-    the secret. That session is never used for anything else.
+    The Caller identity (the one that authenticates every call) supports two auth modes,
+    selected per-script via -CallerAuthMode:
+      - Certificate (default): Service Principal, client_credentials + a JWT assertion
+        (RFC 7523). The certificate itself can come from a local store, a local PFX file, or
+        Azure Key Vault.
+      - Delegated: your own interactive sign-in, via the `az` CLI's own session
+        (`az login` + `az account get-access-token`) - no certificate or app registration
+        needed for the Caller itself.
+    The Connection/RunOwner identity (Dataverse/KeyVault/PadRunOwner types) is always
+    Certificate-based - it never authenticates anything itself, so there's no "delegated" option
+    for it; its client id + certificate are just embedded in the connection for Power Platform to
+    use at run time.
 
     Tested on both Windows PowerShell 5.1 and PowerShell 7+. A couple of things differ between
     those two runtimes and are handled explicitly below: RandomNumberGenerator.Fill() doesn't
@@ -237,6 +244,50 @@ function Get-PPCertClientCredentialsToken {
     $bodyString = ConvertTo-PPFormUrlEncoded -Fields $form
     $response = Invoke-RestMethod -Uri $tokenEndpoint -Method Post -Body $bodyString -ContentType 'application/x-www-form-urlencoded' -TimeoutSec $TimeoutSec
     return $response.access_token
+}
+
+# --- Delegated (interactive) token acquisition, and the unified Caller-token entry point ---
+
+function Get-PPDelegatedToken {
+    # Delegated (interactive) token via the Azure CLI's own signed-in session - the same
+    # az-login-then-az-cli methodology this module already uses for Key Vault access
+    # (Connect-PPAzureCli / Get-PPKeyVaultSecretViaAzCli), generalized to any resource.
+    param(
+        [Parameter(Mandatory)][string]$Resource,
+        [string]$TenantId
+    )
+    Connect-PPAzureCli -TenantId $TenantId
+
+    $tokenArgs = @('account', 'get-access-token', '--resource', $Resource.TrimEnd('/'), '--query', 'accessToken', '--output', 'tsv')
+    if ($TenantId) { $tokenArgs += @('--tenant', $TenantId) }
+    $token = az @tokenArgs 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $token) {
+        throw "Could not obtain a delegated access token for '$Resource' via az account get-access-token. Run 'az login' and make sure the signed-in account has access to this tenant/resource."
+    }
+    return $token
+}
+
+function Get-PPCallerToken {
+    # Single entry point every script uses to get a Caller token, dispatching on -AuthMode so
+    # the scripts themselves never have to branch. Certificate mode needs -ClientId and
+    # -Certificate (see Get-PPCertificateFromSource); Delegated mode needs neither - and ignores
+    # them if passed.
+    param(
+        [Parameter(Mandatory)][ValidateSet('Certificate', 'Delegated')][string]$AuthMode,
+        [Parameter(Mandatory)][string]$Resource,
+        [string]$TenantId,
+        [string]$ClientId,
+        [Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [string]$LoginAuthorityBaseUrl = 'https://login.microsoftonline.com',
+        [int]$TimeoutSec = 100
+    )
+    if ($AuthMode -eq 'Delegated') {
+        return Get-PPDelegatedToken -Resource $Resource -TenantId $TenantId
+    }
+    if (-not $Certificate) { throw "AuthMode 'Certificate' requires -Certificate (load one first via Get-PPCertificateFromSource)." }
+    if (-not $ClientId) { throw "AuthMode 'Certificate' requires -ClientId." }
+    return Get-PPCertClientCredentialsToken -TenantId $TenantId -ClientId $ClientId -Certificate $Certificate `
+        -Scope (Get-PPScopeForResource $Resource) -LoginAuthorityBaseUrl $LoginAuthorityBaseUrl -TimeoutSec $TimeoutSec
 }
 
 # --- Environment host + principal resolution ---
